@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - name: Compute version
+        run: echo "VERSION=1.1.${GITHUB_RUN_NUMBER}" >> "$GITHUB_ENV"
+      - name: Set version
+        run: mvn -B -q versions:set -DnewVersion="$VERSION" -DgenerateBackupPoms=false
+      - name: Build plugin
+        run: |
+          chmod +x build.sh
+          ./build.sh
+      - name: Name the zip
+        run: |
+          mkdir -p dist
+          cp target/tls-manager-*.zip "dist/tls-manager-${VERSION}.zip"
+          (cd dist && sha256sum "tls-manager-${VERSION}.zip" | tee "tls-manager-${VERSION}.zip.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oie-tls-manager
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish release
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          files: dist/*
+          generate_release_notes: true
