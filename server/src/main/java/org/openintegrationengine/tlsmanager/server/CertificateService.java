@@ -97,6 +97,13 @@ public final class CertificateService {
     @Getter
     private KeyStore externalKeyStore;
 
+    /** Minimum gap between looks at the backing store for changes made elsewhere. */
+    private static final long REFRESH_INTERVAL_MILLIS = 15_000;
+
+    private byte[] loadedTrustStoreBytes;
+    private byte[] loadedKeyStoreBytes;
+    private long lastRefreshCheck;
+
     private TrustStoreBackend systemTrustStoreBackend;
     private TrustStoreBackend extraTrustStoreBackend;
     private TrustStoreBackend extraKeyStoreBackend;
@@ -153,9 +160,66 @@ public final class CertificateService {
         loadKeyStore(systemTrustStore, cacertsBytes, systemTrustStoreBackend.loadPassword());
         loadKeyStore(externalTrustStore, extraTrustStoreBytes, extraTrustStoreBackend.loadPassword());
         loadKeyStore(externalKeyStore, extraKeyStoreBytes, extraKeyStoreBackend.loadPassword());
+        loadedTrustStoreBytes = extraTrustStoreBytes;
+        loadedKeyStoreBytes = extraKeyStoreBytes;
+        lastRefreshCheck = System.currentTimeMillis();
+    }
+
+    /**
+     * Reloads the key pair and trust stores if the backing store has changed since they were
+     * read, at most once every {@value #REFRESH_INTERVAL_MILLIS} ms.
+     *
+     * <p>The stores are read once at start-up, so a change made any other way, such as a
+     * restore from a backup or another node in a cluster writing to the shared database,
+     * would otherwise not be seen until a restart.
+     */
+    void refreshIfChanged() {
+        refreshIfChanged(false);
+    }
+
+    synchronized void refreshIfChanged(boolean force) {
+        if (extraKeyStoreBackend == null || extraTrustStoreBackend == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (!force && now - lastRefreshCheck < REFRESH_INTERVAL_MILLIS) {
+            return;
+        }
+        lastRefreshCheck = now;
+        try {
+            byte[] keyBytes = extraKeyStoreBackend.load();
+            if (!java.util.Arrays.equals(keyBytes, loadedKeyStoreBytes)) {
+                loadKeyStore(externalKeyStore, keyBytes, extraKeyStoreBackend.loadPassword());
+                loadedKeyStoreBytes = keyBytes;
+                log.info("Key pair store changed outside this node; reloaded {} entries",
+                    getLocalCertificateAliases().size());
+            }
+            byte[] trustBytes = extraTrustStoreBackend.load();
+            if (!java.util.Arrays.equals(trustBytes, loadedTrustStoreBytes)) {
+                loadKeyStore(externalTrustStore, trustBytes, extraTrustStoreBackend.loadPassword());
+                loadedTrustStoreBytes = trustBytes;
+                log.info("Trusted certificate store changed outside this node; reloaded {} entries",
+                    getTrustedCertificateAliases().size());
+            }
+        } catch (RuntimeException e) {
+            // A failed look must not break the caller; the loaded stores stay as they were.
+            log.warn("Could not check the certificate stores for changes: {}", e.toString());
+        }
+    }
+
+    /** Expired or expiring certificates in the key pair and trusted stores, soonest first. */
+    List<CertificateExpiry.Finding> getExpiringCertificates(int warnDays) {
+        refreshIfChanged();
+        java.time.Instant now = java.time.Instant.now();
+        List<CertificateExpiry.Finding> findings = new ArrayList<>();
+        findings.addAll(CertificateExpiry.scan("key pair", externalKeyStore, now, warnDays));
+        findings.addAll(CertificateExpiry.scan("trusted", externalTrustStore, now, warnDays));
+        findings.sort(java.util.Comparator.comparing(CertificateExpiry.Finding::notAfter));
+        return findings;
     }
 
     KeyStore getKeyStore(String alias) {
+        refreshIfChanged();
         try {
             var keystore = KeyStore.getInstance(PKCS12);
             keystore.load(null, new char[0]);
@@ -198,6 +262,7 @@ public final class CertificateService {
         try (var bais = new ByteArrayInputStream(keystoreBytes)) {
             externalTrustStore.load(bais, password);
             extraTrustStoreBackend.persist(keystoreBytes);
+            loadedTrustStoreBytes = keystoreBytes;
         } catch (CertificateException | IOException | NoSuchAlgorithmException e) {
             log.error("Error overwriting truststore", e);
             throw new RuntimeException(e);
@@ -208,6 +273,7 @@ public final class CertificateService {
         try (var bais = new ByteArrayInputStream(keystoreBytes)) {
             externalKeyStore.load(bais, password);
             extraKeyStoreBackend.persist(keystoreBytes);
+            loadedKeyStoreBytes = keystoreBytes;
         } catch (CertificateException | IOException | NoSuchAlgorithmException e) {
             log.error("Error overwriting keystore", e);
             throw new RuntimeException(e);
@@ -215,6 +281,7 @@ public final class CertificateService {
     }
 
     public Set<String> getTrustedCertificateAliases() {
+        refreshIfChanged();
         try {
             return new HashSet<>(Collections.list(externalTrustStore.aliases()));
         } catch (KeyStoreException e) {
@@ -224,6 +291,7 @@ public final class CertificateService {
     }
 
     public Set<String> getLocalCertificateAliases() {
+        refreshIfChanged();
         try {
             return new HashSet<>(Collections.list(externalKeyStore.aliases()));
         } catch (KeyStoreException e) {
@@ -237,10 +305,12 @@ public final class CertificateService {
     }
 
     public List<TrustedCertificate> getEncodedLocalCertificates() {
+        refreshIfChanged();
         return getEncodedCertificates(externalKeyStore, extraKeyStoreBackend.loadPassword());
     }
 
     public List<TrustedCertificate> getEncodedTrustedCertificates() {
+        refreshIfChanged();
         return getEncodedCertificates(externalTrustStore, extraTrustStoreBackend.loadPassword());
     }
 

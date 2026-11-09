@@ -11,7 +11,7 @@ import { certificate, toPem } from './certificates.mjs';
 // Exercise the browser modules without requiring the host's DOM toast service.
 const { outputFiles } = await build({
     stdin: {
-        contents: "export * from './web/certificateUtils.js'; export * from './web/verificationUtils.js';",
+        contents: "export * from './web/certificateUtils.js'; export * from './web/verificationUtils.js'; export * from './web/expiryWarning.js';",
         resolveDir: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
     },
     bundle: true, format: 'esm', platform: 'browser', write: false,
@@ -168,4 +168,44 @@ test('parseCertificate reads the leaf of a full PEM chain (no atob failure)', as
     assert.equal(details.error, undefined);
     assert.match(details.subjectStr, /leaf\.example/);
     assert.equal(details.fingerprintSha1, (await utils.parseCertificate(leaf.pem)).fingerprintSha1);
+});
+
+const DAY = 86400000;
+const entry = (alias, notAfter, store = 'private') => ({ alias, store, parsedCertificate: { raw: { notAfter: { value: notAfter } } } });
+
+test('expiringCertificates keeps the expired and those inside the window, soonest first', () => {
+    const now = new Date('2026-06-01T00:00:00Z');
+    const found = utils.expiringCertificates([
+        entry('far', new Date(now.getTime() + 31 * DAY + 1000)),
+        entry('soon', new Date(now.getTime() + 10 * DAY + 3600000)),
+        entry('edge', new Date(now.getTime() + 30 * DAY + 1000)),
+        entry('gone', new Date(now.getTime() - 3 * DAY - 3600000)),
+        { alias: 'unparsed', store: 'trusted', parsedCertificate: { error: 'x' } }
+    ], now, 30);
+    assert.deepEqual(found.map(f => [f.alias, f.days, f.expired]), [['gone', -3, true], ['soon', 10, false], ['edge', 30, false]]);
+});
+
+test('checkExpiry warns once, as an error when anything has expired, and skips unreadable stores', async () => {
+    const now = new Date('2026-06-01T00:00:00Z');
+    const sent = [];
+    const findings = await utils.checkExpiry({
+        fetchStores: [
+            async () => [entry('gone', new Date(now.getTime() - DAY - 1000)), entry('soon', new Date(now.getTime() + 5 * DAY + 1000), 'trusted')],
+            async () => { throw new Error('store unavailable'); }
+        ],
+        notify: (message, level) => sent.push({ message, level }),
+        now
+    });
+    assert.equal(findings.length, 2);
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].level, 'error');
+    assert.match(sent[0].message, /2 certificates have expired or will expire within 30 days/);
+    assert.match(sent[0].message, /gone \(expired 1 day\(s\) ago\), soon \(expires in 5 day\(s\)\)/);
+});
+
+test('checkExpiry says nothing when every certificate is comfortably valid', async () => {
+    const now = new Date('2026-06-01T00:00:00Z');
+    const sent = [];
+    await utils.checkExpiry({ fetchStores: [async () => [entry('ok', new Date(now.getTime() + 90 * DAY))]], notify: m => sent.push(m), now });
+    assert.deepEqual(sent, []);
 });

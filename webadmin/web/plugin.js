@@ -21758,6 +21758,48 @@ async function removeCertificate(store, alias, current) {
   return { success: true };
 }
 
+// web/expiryWarning.js
+var WARN_DAYS = 30;
+var DAY_MS = 864e5;
+var MAX_LISTED = 5;
+function expiringCertificates(certs, now = /* @__PURE__ */ new Date(), warnDays = WARN_DAYS) {
+  const findings = [];
+  for (const cert of certs || []) {
+    const notAfter = cert?.parsedCertificate?.raw?.notAfter?.value;
+    if (!(notAfter instanceof Date) || Number.isNaN(notAfter.getTime())) continue;
+    const ms = notAfter.getTime() - now.getTime();
+    const expired = ms < 0;
+    const days = expired ? -Math.floor(-ms / DAY_MS) : Math.floor(ms / DAY_MS);
+    if (expired || days <= warnDays) {
+      findings.push({ alias: String(cert.alias ?? ""), store: cert.store, notAfter, days, expired });
+    }
+  }
+  return findings.sort((a, b) => a.notAfter - b.notAfter);
+}
+function describeExpiring(findings, warnDays = WARN_DAYS) {
+  const expired = findings.filter((f) => f.expired).length;
+  const level = expired > 0 ? "error" : "warn";
+  const listed = findings.slice(0, MAX_LISTED).map((f) => {
+    if (f.expired) return `${f.alias} (expired ${f.days === 0 ? "today" : `${-f.days} day(s) ago`})`;
+    return `${f.alias} (${f.days === 0 ? "expires today" : `expires in ${f.days} day(s)`})`;
+  });
+  const more = findings.length > MAX_LISTED ? `, and ${findings.length - MAX_LISTED} more` : "";
+  const noun = findings.length === 1 ? "certificate has" : "certificates have";
+  return {
+    level,
+    message: `TLS Manager: ${findings.length} ${noun} expired or will expire within ${warnDays} days: ${listed.join(", ")}${more}. See Settings \u2192 TLS Manager.`
+  };
+}
+async function checkExpiry({ fetchStores, notify, now = /* @__PURE__ */ new Date(), warnDays = WARN_DAYS }) {
+  const lists = await Promise.all(fetchStores.map((fetch) => Promise.resolve().then(fetch).catch(() => [])));
+  const findings = expiringCertificates(lists.flat(), now, warnDays);
+  if (findings.length > 0) {
+    const { level, message } = describeExpiring(findings, warnDays);
+    notify(message, level);
+  }
+  return findings;
+}
+
 // web/plugin.jsx
 var React = platform.React;
 var FQCN = "org.openintegrationengine.tlsmanager.shared.properties.TLSConnectorProperties";
@@ -23178,8 +23220,35 @@ The existing certificate is used by ${chans.length} channel(s): ${chans.join(", 
   const act = { openDetails, editAlias, removeCert, canWrite };
   return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "tabs", style: { marginBottom: "10px" } }, STORE_TABS.map((t) => /* @__PURE__ */ React.createElement("button", { key: t.key, type: "button", className: "tab" + (t.key === tab ? " active" : ""), onClick: () => setTab(t.key) }, t.label, " (", storesRef.current[t.key].length, ")"))), /* @__PURE__ */ React.createElement("div", { className: "panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-header" }, tabDef.label, /* @__PURE__ */ React.createElement("div", { className: "panel-tools" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: writePendingRef.current, onClick: refresh }, "Refresh"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: () => openImportFile("trusted") }, "Import Certificate"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportChain }, "Import Chain"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportUrl }, "Import from URL"), tab === "private" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm btn-primary", disabled: !canWrite, onClick: () => openImportFile("private") }, "Import Key Pair"))), /* @__PURE__ */ React.createElement("div", { className: "panel-body flush" }, tabDef.readonly && /* @__PURE__ */ React.createElement("div", { className: "hint", style: { padding: "8px 14px" } }, "Read-only system truststore (from the engine's JRE)."), storeState.error && /* @__PURE__ */ React.createElement("div", { role: "alert", style: { padding: "12px 14px", color: "var(--err)" } }, storeState.error), certTableEl(storesRef.current[tab], tab, act))), /* @__PURE__ */ React.createElement("div", { className: "text-text-faint", style: { marginTop: "10px", fontSize: "11px" } }, version ? `TLS Manager Plugin ${version} \xB7 ` : "", "Sponsored by NovaMap Health & Diridium Technologies, donated to the Open Integration Engine initiative."));
 }
+var EXPIRY_SESSION_KEY = "tlsManagerExpiryChecked";
+function startExpiryWarning() {
+  try {
+    if (sessionStorage.getItem(EXPIRY_SESSION_KEY)) return;
+  } catch (e) {
+  }
+  let attempts = 0;
+  const timer = setInterval(() => {
+    attempts += 1;
+    if (attempts > 90) {
+      clearInterval(timer);
+      return;
+    }
+    if (!platform.store.getState("serverVersion")) return;
+    clearInterval(timer);
+    try {
+      sessionStorage.setItem(EXPIRY_SESSION_KEY, "1");
+    } catch (e) {
+    }
+    checkExpiry({
+      fetchStores: [fetchLocalCertificates, fetchTrustedCertificates],
+      notify: (message, level) => toast2(message, level)
+    }).catch(() => {
+    });
+  }, 2e3);
+}
 function register(platform2) {
   platform2.registerConnectorPropertiesPanel(tlsPanel);
+  startExpiryWarning();
   platform2.registerSettingsPanel({
     label: "TLS Manager",
     order: 110,
