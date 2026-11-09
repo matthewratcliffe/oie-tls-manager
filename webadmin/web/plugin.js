@@ -21447,7 +21447,7 @@ function formatDate(date) {
 }
 async function parseCertificate(base64Pem) {
   try {
-    const der = pemToDer(base64Pem);
+    const der = pemToDer(extractCertificatePems(base64Pem)[0] || base64Pem);
     const cert = parsePemCertificate(base64Pem);
     const subjectFormatted = rdnToString(cert.subject);
     const subject = parseDNString(subjectFormatted);

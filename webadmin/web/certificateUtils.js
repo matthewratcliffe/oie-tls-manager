@@ -4,6 +4,7 @@ import {
   decodeAltNames,
   decodeKeyUsageBits,
   digestHex,
+  extractCertificatePems,
   extractPrivateKeyBlock,
   findExtensionByOid,
   OID,
@@ -164,7 +165,8 @@ function formatDate(date) {
  */
 export async function parseCertificate(base64Pem) {
   try {
-    const der = pemToDer(base64Pem)
+    // A stored chain is several PEM blocks; fingerprint and parse the leaf (first) only.
+    const der = pemToDer(extractCertificatePems(base64Pem)[0] || base64Pem)
     const cert = parsePemCertificate(base64Pem)
 
     const subjectFormatted = rdnToString(cert.subject)

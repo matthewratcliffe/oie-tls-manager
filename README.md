@@ -1,5 +1,16 @@
 # TLS Manager Plugin for Open Integration Engine
 
+# About this fork
+
+This is a fork of [NovaMap-Health/tls-manager-plugin](https://github.com/NovaMap-Health/tls-manager-plugin), maintained at [matthewratcliffe/oie-tls-manager](https://github.com/matthewratcliffe/oie-tls-manager). It stays on upstream's licence (MPL 2.0) and copyright notices. What differs:
+
+- **Full certificate chains for local certificates.** Upstream decoded a PEM holding a chain (leaf plus intermediates) as one certificate, which failed with "Input byte array has incorrect ending byte", and stored only one certificate per key entry. Because the UI re-sends every local certificate on each save, one chained entry broke every later save. Here a chain is accepted and stored whole, so TLS connectors present the intermediates. Trusted certificates still hold a single certificate, now with a clear error when given several (`CertificateService`, covered by `CertificateChainTest`).
+- **Web admin reads the leaf of a chain.** The console's certificate view fingerprinted the whole stored chain and showed "Parse Error: Failed to execute 'atob'". It now parses the first (leaf) certificate, with a regression test.
+- **Release zips from CI.** `.github/workflows/ci.yml` builds on every push to `main` and every pull request. Each build is versioned `1.1.<run number>`, and pushes to `main` publish a GitHub release with `tls-manager-<version>.zip` and its `.sha256`. Upstream releases are tagged by hand.
+- **Where the UI appears in the web console.** This plugin's web admin adds a **TLS Manager** tab under *Settings* and a **TLS Settings** panel on connectors. It does not add a sidebar entry. The standalone app is still at `/tls-manager/`.
+
+Everything else, including the connectors, the REST API at `/api/tlsmanager` and the keystore handling, is upstream's.
+
 # Introduction
 
 This TLS Manager Plugin for OIE has been sponsored by [NovaMap Health Limited](https://www.novamap.health/) (UK) and [Diridium Technologies Inc.](https://diridium.com/) (USA) and donated to the Open Integration Engine initiative. Copyright is retained by NovaMap Health Limited but is licensed under MPL 2.0.
