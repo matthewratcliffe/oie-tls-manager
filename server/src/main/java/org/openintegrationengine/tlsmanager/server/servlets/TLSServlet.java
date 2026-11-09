@@ -36,7 +36,11 @@ import java.io.InputStream;
 import java.security.KeyStoreException;
 import java.security.NoSuchAlgorithmException;
 import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 @Slf4j
@@ -193,4 +197,94 @@ public class TLSServlet extends MirthServlet implements TLSServletInterface {
             throw new MirthApiException(e);
         }
     }
-}
+
+    @Override
+    public Map<String, Object> createCertificateAuthority(Map<String, String> request) {
+        return authorityCall("create the CA", () -> certificateService.createCa(
+            field(request, "alias"), field(request, "subject"), field(request, "keyType"),
+            intField(request, "validityDays"), intField(request, "pathLength"),
+            field(request, "issuerAlias"), flag(request, "replace")));
+    }
+
+    @Override
+    public Map<String, Object> renewCertificateAuthority(Map<String, String> request) {
+        return authorityCall("renew the CA", () -> certificateService.renewCa(
+            field(request, "alias"), intField(request, "validityDays"), field(request, "issuerAlias")));
+    }
+
+    @Override
+    public Map<String, Object> issueCertificate(Map<String, String> request) {
+        return authorityCall("issue the certificate", () -> certificateService.issueLeaf(
+            field(request, "caAlias"), field(request, "alias"), field(request, "subject"),
+            names(field(request, "subjectAltNames")), field(request, "keyType"),
+            intField(request, "validityDays"), flag(request, "replace")));
+    }
+
+    /**
+     * Runs a CA operation. A request the caller got wrong (no such CA, an expired CA, a bad
+     * subject) is a 400 with the reason as text; the private key is never part of the answer.
+     */
+    private Map<String, Object> authorityCall(String what, java.util.concurrent.Callable<CertificateService.CaResult> call) {
+        try {
+            CertificateService.CaResult result = call.call();
+            X509Certificate leaf = result.chain()[0];
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", "true");
+            out.put("alias", result.alias());
+            out.put("subject", leaf.getSubjectX500Principal().getName());
+            out.put("issuer", leaf.getIssuerX500Principal().getName());
+            out.put("notBefore", leaf.getNotBefore().toInstant().toString());
+            out.put("notAfter", leaf.getNotAfter().toInstant().toString());
+            out.put("cappedToIssuer", String.valueOf(result.cappedToIssuer()));
+            out.put("certificate", CertificateService.pem(result.chain()));
+            out.put("updatedChains", String.join(",", result.updatedChains()));
+            out.put("updatedTrusted", String.join(",", result.updatedTrusted()));
+            return out;
+        } catch (IllegalArgumentException e) {
+            throw plainError(Response.Status.BAD_REQUEST, e.getMessage());
+        } catch (WebApplicationException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("Could not {}", what, e);
+            throw plainError(Response.Status.INTERNAL_SERVER_ERROR, "Could not " + what + ": " + e.getMessage());
+        }
+    }
+
+    private static WebApplicationException plainError(Response.Status status, String message) {
+        return new WebApplicationException(Response.status(status).entity(message)
+            .type(javax.ws.rs.core.MediaType.TEXT_PLAIN).build());
+    }
+
+    private static String field(Map<String, String> request, String key) {
+        String value = request == null ? null : request.get(key);
+        return value == null || value.isBlank() ? null : value.trim();
+    }
+
+    private static Integer intField(Map<String, String> request, String key) {
+        String value = field(request, key);
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("\"" + key + "\" must be a whole number, not \"" + value + "\".");
+        }
+    }
+
+    private static boolean flag(Map<String, String> request, String key) {
+        return "true".equalsIgnoreCase(field(request, key));
+    }
+
+    /** Subject alternative names separated by commas, semicolons or new lines. */
+    private static List<String> names(String value) {
+        List<String> names = new ArrayList<>();
+        if (value != null) {
+            for (String name : value.split("[,;\\r\\n]+")) {
+                if (!name.isBlank()) {
+                    names.add(name.trim());
+                }
+            }
+        }
+        return names;
+    }}

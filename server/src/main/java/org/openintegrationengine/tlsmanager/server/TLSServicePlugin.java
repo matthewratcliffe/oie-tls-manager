@@ -29,6 +29,9 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 @MirthServerClass
 @Slf4j
@@ -46,6 +49,8 @@ public class TLSServicePlugin implements ServicePlugin {
     private WebServiceService webServiceService;
 
     private TLSPluginConfiguration tlsPluginConfiguration;
+
+    private ScheduledExecutorService expiryMonitor;
 
     @Override
     public void init(Properties properties) {
@@ -131,10 +136,49 @@ public class TLSServicePlugin implements ServicePlugin {
     @Override
     public void start() {
         this.certificateService.init(tlsPluginConfiguration);
+        startExpiryMonitor();
     }
 
     @Override
     public void stop() {
+        if (expiryMonitor != null) {
+            expiryMonitor.shutdownNow();
+            expiryMonitor = null;
+        }
+    }
+
+    /**
+     * Logs certificates that have expired or expire within TLS_EXPIRY_WARN_DAYS (default 30)
+     * a minute after start and then once a day, as WARN, or ERROR once expired.
+     */
+    private void startExpiryMonitor() {
+        int warnDays = CertificateExpiry.warnDays(System.getenv("TLS_EXPIRY_WARN_DAYS"));
+        expiryMonitor = Executors.newSingleThreadScheduledExecutor(runnable -> {
+            Thread thread = new Thread(runnable, "tls-manager-expiry-monitor");
+            thread.setDaemon(true);
+            return thread;
+        });
+        expiryMonitor.scheduleWithFixedDelay(() -> logExpiringCertificates(warnDays),
+            1, 24 * 60, TimeUnit.MINUTES);
+    }
+
+    void logExpiringCertificates(int warnDays) {
+        try {
+            var findings = certificateService.getExpiringCertificates(warnDays);
+            if (findings.isEmpty()) {
+                log.info("No TLS certificates expire within {} days", warnDays);
+                return;
+            }
+            for (var finding : findings) {
+                if (finding.expired()) {
+                    log.error(finding.describe());
+                } else {
+                    log.warn(finding.describe());
+                }
+            }
+        } catch (RuntimeException e) {
+            log.warn("Could not check TLS certificate expiry: {}", e.toString());
+        }
     }
 
     public static TLSServicePlugin getPluginInstance() {

@@ -40,6 +40,7 @@ import javax.ws.rs.QueryParam;
 import javax.ws.rs.core.MediaType;
 import java.io.InputStream;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static javax.ws.rs.core.MediaType.APPLICATION_JSON;
@@ -480,5 +481,57 @@ public interface TLSServletInterface extends BaseServletInterface {
         @Parameter(description = "Password used to authenticate to the web server.", schema = @Schema(description = "Password used to authenticate to the web server."))
         @FormParam("password")
         String password
+    ) throws ClientException;
+
+    @POST
+    @Path("/ca/create")
+    @io.swagger.v3.oas.annotations.Operation(
+        summary = "Create a certificate authority key pair: a self-signed root, or an intermediate signed by a CA already held."
+    )
+    @MirthOperation(
+        name = "createCertificateAuthority",
+        display = "Create a certificate authority",
+        type = Operation.ExecuteType.SYNC
+    )
+    Map<String, Object> createCertificateAuthority(
+        @Param("request")
+        @Parameter(description = "subject (required), alias, keyType, validityDays, pathLength, "
+            + "issuerAlias (blank for a self-signed root), replace.")
+        Map<String, String> request
+    ) throws ClientException;
+
+    @POST
+    @Path("/ca/renew")
+    @io.swagger.v3.oas.annotations.Operation(
+        summary = "Renew a certificate authority key pair: same key and subject, new validity. "
+            + "Chains and trusted certificates holding the old CA certificate are updated."
+    )
+    @MirthOperation(
+        name = "renewCertificateAuthority",
+        display = "Renew a certificate authority",
+        type = Operation.ExecuteType.SYNC
+    )
+    Map<String, Object> renewCertificateAuthority(
+        @Param("request")
+        @Parameter(description = "alias (required), validityDays (default: the current validity length), "
+            + "issuerAlias (only if it cannot be found by its subject).")
+        Map<String, String> request
+    ) throws ClientException;
+
+    @POST
+    @Path("/ca/issue")
+    @io.swagger.v3.oas.annotations.Operation(
+        summary = "Generate a key pair and a leaf certificate signed by a CA key pair held here, and save it."
+    )
+    @MirthOperation(
+        name = "issueCertificate",
+        display = "Issue a certificate from a certificate authority",
+        type = Operation.ExecuteType.SYNC
+    )
+    Map<String, Object> issueCertificate(
+        @Param("request")
+        @Parameter(description = "caAlias and subject (required), alias, subjectAltNames "
+            + "(comma or line separated), keyType, validityDays, replace.")
+        Map<String, String> request
     ) throws ClientException;
 }
