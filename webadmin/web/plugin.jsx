@@ -47,6 +47,7 @@ import {
 } from './tlsService.js';
 import { isValidPemCertificate, isValidPemPrivateKey, parseCertificateChainFromPem, base64ToPem, base64ToPrivateKeyPem, parseCertificate, getSuggestedAlias } from './certificateUtils.js';
 import { verifyCertificate } from './verificationUtils.js';
+import { checkExpiry } from './expiryWarning.js';
 
 const FQCN = 'org.openintegrationengine.tlsmanager.shared.properties.TLSConnectorProperties';
 // The TLS Manager servlet uses @Path("/tlsmanager") — NOT the usual
@@ -1381,8 +1382,33 @@ function TlsManagerPanel() {
     );
 }
 
+/*
+ * Warn once per console session about certificates that have expired or expire within 30
+ * days. register() runs when the console loads, which can be before anyone has signed in, so
+ * this waits until the server version is in the store (it is only known after sign-in) and
+ * gives up after three minutes. Nothing here may throw: it runs unprompted.
+ */
+const EXPIRY_SESSION_KEY = 'tlsManagerExpiryChecked';
+
+function startExpiryWarning() {
+    try { if (sessionStorage.getItem(EXPIRY_SESSION_KEY)) return; } catch (e) { /* no storage: warn each load */ }
+    let attempts = 0;
+    const timer = setInterval(() => {
+        attempts += 1;
+        if (attempts > 90) { clearInterval(timer); return; }
+        if (!platform.store.getState('serverVersion')) return;
+        clearInterval(timer);
+        try { sessionStorage.setItem(EXPIRY_SESSION_KEY, '1'); } catch (e) { /* ignore */ }
+        checkExpiry({
+            fetchStores: [fetchLocalCertificates, fetchTrustedCertificates],
+            notify: (message, level) => toast(message, level)
+        }).catch(() => { /* a failed check is not worth an error */ });
+    }, 2000);
+}
+
 export function register(platform) {
     platform.registerConnectorPropertiesPanel(tlsPanel);
+    startExpiryWarning();
 
     platform.registerSettingsPanel({
         label: 'TLS Manager',
