@@ -161,3 +161,11 @@ test('Web Crypto digest/import/sign/verify failures produce errors, never succes
     }
     assert.equal((await utils.verifyCertificate(rsa.pem, rsa.privateKeyPem)).success, true);
 });
+
+test('parseCertificate reads the leaf of a full PEM chain (no atob failure)', async () => {
+    const chain = [leaf.pem, intermediate.pem, root.pem].join(String.fromCharCode(10));
+    const details = await utils.parseCertificate(chain);
+    assert.equal(details.error, undefined);
+    assert.match(details.subjectStr, /leaf\.example/);
+    assert.equal(details.fingerprintSha1, (await utils.parseCertificate(leaf.pem)).fingerprintSha1);
+});
