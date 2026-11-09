@@ -11,7 +11,7 @@ import { certificate, toPem } from './certificates.mjs';
 // Exercise the browser modules without requiring the host's DOM toast service.
 const { outputFiles } = await build({
     stdin: {
-        contents: "export * from './web/certificateUtils.js'; export * from './web/verificationUtils.js'; export * from './web/expiryWarning.js';",
+        contents: "export * from './web/certificateUtils.js'; export * from './web/verificationUtils.js'; export * from './web/expiryWarning.js'; export * from './web/caService.js';",
         resolveDir: path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
     },
     bundle: true, format: 'esm', platform: 'browser', write: false,
@@ -208,4 +208,85 @@ test('checkExpiry says nothing when every certificate is comfortably valid', asy
     const sent = [];
     await utils.checkExpiry({ fetchStores: [async () => [entry('ok', new Date(now.getTime() + 90 * DAY))]], notify: m => sent.push(m), now });
     assert.deepEqual(sent, []);
+});
+
+const keyPair = async (alias, fixture) => {
+    const parsed = await utils.parseCertificate(fixture.pem);
+    return { alias, store: 'private', type: parsed.type, validTo: parsed.validTo, parsedCertificate: parsed };
+};
+
+test('CA requests are encoded as the server\'s <map> and answers decoded from it', () => {
+    const xml = utils.encodeMap({ subject: 'CN=A & B <CA>', alias: '', validityDays: undefined, replace: 'true', pathLength: null });
+    assert.equal(xml, '<map><entry><string>subject</string><string>CN=A &amp; B &lt;CA&gt;</string></entry>'
+        + '<entry><string>replace</string><string>true</string></entry></map>');
+
+    const answer = utils.decodeMap('<map><entry><string>ok</string><string>true</string></entry>'
+        + '<entry><string>alias</string><string>Lab &amp; Root</string></entry>'
+        + '<entry><string>updatedChains</string><string/></entry>'
+        + '<entry><string>certificate</string><string>-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n</string></entry></map>');
+    assert.deepEqual(Object.keys(answer), ['ok', 'alias', 'updatedChains', 'certificate']);
+    assert.equal(answer.alias, 'Lab & Root');
+    assert.equal(answer.updatedChains, '');
+    assert.match(answer.certificate, /^-----BEGIN CERTIFICATE-----\nMIIB/);
+    assert.deepEqual(utils.decodeMap('not xml'), {});
+});
+
+test('error bodies read as plain sentences, with a fallback', () => {
+    assert.equal(utils.errorText('The CA "x" expired.', 400), 'The CA "x" expired.');
+    assert.equal(utils.errorText('<html><body><h1>Server Error</h1></body></html>', 500), 'Server Error');
+    assert.equal(utils.errorText('', 502), 'The request failed (HTTP 502).');
+});
+
+test('validity and path length are whole numbers, and blank means the server default', () => {
+    assert.equal(utils.daysValue(' '), undefined);
+    assert.equal(utils.daysValue('825'), '825');
+    assert.throws(() => utils.daysValue('0'), /at least 1/);
+    assert.throws(() => utils.daysValue('2.5'), /whole number/);
+    assert.equal(utils.pathLengthValue(''), undefined);
+    assert.equal(utils.pathLengthValue('0'), '0');
+    assert.throws(() => utils.pathLengthValue('-1'), /whole number/);
+});
+
+test('only CA key pairs are offered to sign, longest-lived first, and expired ones are flagged', async () => {
+    const entries = [
+        await keyPair('inter', intermediate),
+        await keyPair('root', root),
+        { ...(await keyPair('leaf', leaf)), alias: 'leaf' },
+        { ...(await keyPair('trusted-root', root)), store: 'trusted' }
+    ];
+    assert.deepEqual(entries.map((e) => [e.alias, utils.isCaEntry(e)]),
+        [['inter', true], ['root', true], ['leaf', false], ['trusted-root', false]]);
+
+    const offered = utils.authorities(entries);
+    assert.deepEqual(offered.map((a) => a.alias).sort(), ['inter', 'root']);
+    assert.ok(offered.every((a) => a.notAfter instanceof Date && a.expired === false));
+
+    const later = new Date(offered[0].notAfter.getTime() + 86400000);
+    assert.ok(utils.authorities(entries, later).every((a) => a.expired));
+});
+
+test('renewal is due when a CA has expired or is within the warning window', async () => {
+    const entry = await keyPair('root', root);
+    const end = entry.parsedCertificate.raw.notAfter.value;
+    const day = 86400000;
+
+    assert.deepEqual(utils.renewalStatus(entry, new Date(end.getTime() - 400 * day)), { days: 400, expired: false, due: false });
+    assert.equal(utils.renewalStatus(entry, new Date(end.getTime() - 89 * day)).due, true);
+    assert.deepEqual(utils.renewalStatus(entry, new Date(end.getTime() + 3 * day + 1000)), { days: -3, expired: true, due: true });
+    assert.equal(utils.renewalStatus({ validTo: 'Unknown' }), null);
+});
+
+test('an issued certificate is shown as ending with its CA when that comes first', () => {
+    const now = new Date('2026-06-01T00:00:00Z');
+    const caEnd = new Date('2027-01-01T00:00:00Z');
+
+    assert.deepEqual(utils.effectiveEnd(100, caEnd, now), { end: new Date('2026-09-09T00:00:00Z'), capped: false });
+    assert.deepEqual(utils.effectiveEnd(825, caEnd, now), { end: caEnd, capped: true });
+});
+
+test('a subject suggests its CN as the alias', () => {
+    assert.equal(utils.commonNameOf('CN=Lab Root CA, O=Example'), 'Lab Root CA');
+    assert.equal(utils.commonNameOf('O=Example, CN=host.example.org'), 'host.example.org');
+    assert.equal(utils.commonNameOf('host.example.org'), 'host.example.org');
+    assert.equal(utils.commonNameOf('O=Example'), '');
 });
