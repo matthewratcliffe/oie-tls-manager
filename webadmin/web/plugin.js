@@ -21791,13 +21791,111 @@ function describeExpiring(findings, warnDays = WARN_DAYS) {
   };
 }
 async function checkExpiry({ fetchStores, notify, now = /* @__PURE__ */ new Date(), warnDays = WARN_DAYS }) {
-  const lists = await Promise.all(fetchStores.map((fetch) => Promise.resolve().then(fetch).catch(() => [])));
+  const lists = await Promise.all(fetchStores.map((fetch2) => Promise.resolve().then(fetch2).catch(() => [])));
   const findings = expiringCertificates(lists.flat(), now, warnDays);
   if (findings.length > 0) {
     const { level, message } = describeExpiring(findings, warnDays);
     notify(message, level);
   }
   return findings;
+}
+
+// web/caService.js
+var BASE2 = "/api/tlsmanager/ca";
+var CA_TYPES = /* @__PURE__ */ new Set(["Root CA", "Intermediate"]);
+var DEFAULT_CA_DAYS = 3650;
+var DEFAULT_LEAF_DAYS = 825;
+var KEY_TYPES = [
+  { value: "RSA_2048", label: "RSA 2048" },
+  { value: "RSA_3072", label: "RSA 3072" },
+  { value: "RSA_4096", label: "RSA 4096" },
+  { value: "EC_P256", label: "EC P-256" },
+  { value: "EC_P384", label: "EC P-384" }
+];
+var DAY_MS2 = 864e5;
+var escapeXml = (v) => String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+var unescapeXml = (v) => v.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n))).replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCodePoint(parseInt(n, 16))).replace(/&amp;/g, "&");
+function encodeMap(obj) {
+  const entries = Object.keys(obj).filter((k) => obj[k] !== void 0 && obj[k] !== null && String(obj[k]).trim() !== "").map((k) => `<entry><string>${escapeXml(k)}</string><string>${escapeXml(obj[k])}</string></entry>`).join("");
+  return `<map>${entries}</map>`;
+}
+function decodeMap(xml) {
+  const out = {};
+  const text = String(xml || "");
+  const entry = /<entry>([\s\S]*?)<\/entry>/g;
+  const str = /<string(?:\s*\/>|>([\s\S]*?)<\/string>)/g;
+  let e;
+  while ((e = entry.exec(text)) !== null) {
+    const parts = [];
+    let s;
+    str.lastIndex = 0;
+    while ((s = str.exec(e[1])) !== null) parts.push(unescapeXml(s[1] || ""));
+    if (parts.length >= 1) out[parts[0]] = parts[1] || "";
+  }
+  return out;
+}
+function errorText(body, status) {
+  const text = String(body || "").replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim();
+  return text || `The request failed (HTTP ${status}).`;
+}
+async function post(path, request) {
+  const res = await fetch(BASE2 + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/xml", Accept: "application/xml", "X-Requested-With": "oie-webadmin" },
+    credentials: "same-origin",
+    body: encodeMap(request)
+  });
+  const body = await res.text();
+  if (!res.ok) {
+    const error = new Error(errorText(body, res.status));
+    error.status = res.status;
+    throw error;
+  }
+  return decodeMap(body);
+}
+function daysValue(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return void 0;
+  if (!/^\d+$/.test(t) || Number(t) < 1) throw new Error("Validity must be a whole number of days, at least 1.");
+  return t;
+}
+function pathLengthValue(text) {
+  const t = String(text ?? "").trim();
+  if (!t) return void 0;
+  if (!/^\d+$/.test(t)) throw new Error("Path length must be a whole number, 0 or more.");
+  return t;
+}
+var createCertificateAuthority = (request) => post("/create", request);
+var renewCertificateAuthority = (request) => post("/renew", request);
+var issueCertificate = (request) => post("/issue", request);
+function isCaEntry(cert) {
+  return !!cert && cert.store === "private" && CA_TYPES.has(cert.type);
+}
+function authorities(certs, now = /* @__PURE__ */ new Date()) {
+  return (certs || []).filter(isCaEntry).map((c) => {
+    const notAfter = c.parsedCertificate?.raw?.notAfter?.value;
+    const end = notAfter instanceof Date ? notAfter : new Date(c.validTo);
+    const valid = !Number.isNaN(end.getTime());
+    return { alias: c.alias, subject: c.subject, type: c.type, notAfter: valid ? end : null, expired: valid && end < now };
+  }).sort((a, b) => (b.notAfter?.getTime() ?? 0) - (a.notAfter?.getTime() ?? 0));
+}
+function renewalStatus(cert, now = /* @__PURE__ */ new Date(), warnDays = 90) {
+  const notAfter = cert?.parsedCertificate?.raw?.notAfter?.value;
+  const end = notAfter instanceof Date ? notAfter : new Date(cert?.validTo);
+  if (Number.isNaN(end.getTime())) return null;
+  const ms = end.getTime() - now.getTime();
+  const days = ms < 0 ? -Math.floor(-ms / DAY_MS2) : Math.floor(ms / DAY_MS2);
+  return { days, expired: ms < 0, due: ms < 0 || days <= warnDays };
+}
+function effectiveEnd(days, issuerNotAfter, now = /* @__PURE__ */ new Date()) {
+  const wanted = new Date(now.getTime() + days * DAY_MS2);
+  if (issuerNotAfter instanceof Date && issuerNotAfter < wanted) return { end: issuerNotAfter, capped: true };
+  return { end: wanted, capped: false };
+}
+function commonNameOf(subject) {
+  const m = /(?:^|,)\s*CN\s*=\s*((?:\\,|[^,])*)/i.exec(subject || "");
+  if (m) return m[1].replace(/\\,/g, ",").trim();
+  return subject && !subject.includes("=") ? subject.trim() : "";
 }
 
 // web/plugin.jsx
@@ -22473,7 +22571,7 @@ function certTableEl(certs, store, act) {
   if (!certs.length) return /* @__PURE__ */ React.createElement("div", { className: "dt-empty", style: { padding: "24px" } }, "No certificates in this store.");
   return /* @__PURE__ */ React.createElement("table", { className: "dt" }, /* @__PURE__ */ React.createElement("thead", null, /* @__PURE__ */ React.createElement("tr", null, /* @__PURE__ */ React.createElement("th", { style: { width: "130px" } }, "Status"), /* @__PURE__ */ React.createElement("th", null, "Alias"), /* @__PURE__ */ React.createElement("th", null, "Subject"), /* @__PURE__ */ React.createElement("th", { style: { width: "150px" } }, "Type"), /* @__PURE__ */ React.createElement("th", { style: { width: "110px" } }, "Expires"), /* @__PURE__ */ React.createElement("th", { style: { width: "60px" } }, "In Use"), /* @__PURE__ */ React.createElement("th", { style: { width: "1px" } }))), /* @__PURE__ */ React.createElement("tbody", null, certs.map((c) => {
     const s = certStatus(c);
-    return /* @__PURE__ */ React.createElement("tr", { key: c.store + ":" + c.alias }, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "status-cell" }, /* @__PURE__ */ React.createElement("span", { className: "pip " + s.pip }), " ", s.label)), /* @__PURE__ */ React.createElement("td", null, c.alias), /* @__PURE__ */ React.createElement("td", { title: c.subject, style: { maxWidth: "260px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, c.name), /* @__PURE__ */ React.createElement("td", null, c.type), /* @__PURE__ */ React.createElement("td", { className: "num" }, c.validTo), /* @__PURE__ */ React.createElement("td", { className: "num" }, (c.channelsInUse || []).length || ""), /* @__PURE__ */ React.createElement("td", { style: { whiteSpace: "nowrap", textAlign: "right" } }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", onClick: () => act.openDetails(c) }, "Details"), store !== "native" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !act.canWrite, onClick: () => act.editAlias(c) }, "Edit"), store !== "native" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm btn-danger", disabled: !act.canWrite, onClick: () => act.removeCert(c) }, "Delete")));
+    return /* @__PURE__ */ React.createElement("tr", { key: c.store + ":" + c.alias }, /* @__PURE__ */ React.createElement("td", null, /* @__PURE__ */ React.createElement("span", { className: "status-cell" }, /* @__PURE__ */ React.createElement("span", { className: "pip " + s.pip }), " ", s.label)), /* @__PURE__ */ React.createElement("td", null, c.alias), /* @__PURE__ */ React.createElement("td", { title: c.subject, style: { maxWidth: "260px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" } }, c.name), /* @__PURE__ */ React.createElement("td", null, c.type), /* @__PURE__ */ React.createElement("td", { className: "num" }, c.validTo), /* @__PURE__ */ React.createElement("td", { className: "num" }, (c.channelsInUse || []).length || ""), /* @__PURE__ */ React.createElement("td", { style: { whiteSpace: "nowrap", textAlign: "right" } }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", onClick: () => act.openDetails(c) }, "Details"), isCaEntry(c) && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !act.canWrite, title: "Generate a key pair and certificate signed by this CA", onClick: () => act.issueFrom(c) }, "Issue"), isCaEntry(c) && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm" + ((renewalStatus(c) || {}).due ? " btn-primary" : ""), disabled: !act.canWrite, title: "Re-issue this CA certificate with the same key and a new validity period", onClick: () => act.renewCa(c) }, "Renew"), store !== "native" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !act.canWrite, onClick: () => act.editAlias(c) }, "Edit"), store !== "native" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm btn-danger", disabled: !act.canWrite, onClick: () => act.removeCert(c) }, "Delete")));
   })));
 }
 var toCertPem = (v) => v && /-----BEGIN/.test(v) ? v : v ? base64ToPem(v) : v;
@@ -23209,6 +23307,206 @@ The existing certificate is used by ${chans.length} channel(s): ${chans.join(", 
       }]
     });
   }
+  async function runCa(operation, successMessage) {
+    if (!writableStore("private")) return false;
+    writePendingRef.current = true;
+    force();
+    let ok = false;
+    try {
+      const result = await operation();
+      ok = true;
+      if (mountedRef.current) toast2(successMessage(result), "success");
+    } catch (e) {
+      if (mountedRef.current) toast2(e.message || "The request failed", "error");
+    } finally {
+      writePendingRef.current = false;
+    }
+    if (mountedRef.current) await refresh();
+    return ok;
+  }
+  const day = (d) => (d instanceof Date ? d : new Date(d)).toISOString().slice(0, 10);
+  const caFieldRow = (label, control, hint) => h(
+    "div",
+    { style: { display: "grid", gridTemplateColumns: "150px 1fr", gap: "8px", alignItems: "start" } },
+    h("label", { style: { paddingTop: "4px" } }, label),
+    h("div", { style: { display: "flex", flexDirection: "column", gap: "2px" } }, control, hint ? h("div.hint", hint) : null)
+  );
+  function caSelect(options, value) {
+    const select = h("select", { style: { width: "100%" } }, ...options.map((o) => h("option", { value: o.value, disabled: !!o.disabled }, o.label)));
+    select.value = value;
+    return select;
+  }
+  const caOption = (c) => ({ value: c.alias, label: `${c.alias} (${c.type}, to ${c.notAfter ? day(c.notAfter) : "?"})${c.expired ? " - expired, renew first" : ""}`, disabled: c.expired });
+  const keyTypeSelect = (value) => caSelect(KEY_TYPES, value);
+  function openCreateCa() {
+    if (!writableStore("private")) return;
+    const held = authorities(storesRef.current.private);
+    const subject = textInput("CN=My Root CA, O=My Organisation", { style: { width: "100%" } });
+    const alias = textInput("", { placeholder: "Defaults to the CN", style: { width: "100%" } });
+    const issuer = caSelect([{ value: "", label: "None: self-signed root CA" }, ...held.map(caOption)], "");
+    const keyType = keyTypeSelect("RSA_3072");
+    const days = textInput(String(DEFAULT_CA_DAYS), { style: { width: "120px" } });
+    const pathLength = textInput("", { placeholder: "No limit", style: { width: "120px" } });
+    const body = h(
+      "div",
+      { style: { minWidth: "540px", display: "flex", flexDirection: "column", gap: "8px" } },
+      caFieldRow("Subject", subject, "The CA's distinguished name, e.g. CN=Example Root CA, O=Example, C=AU."),
+      caFieldRow("Alias", alias),
+      caFieldRow("Signed by", issuer, "Leave as self-signed for a root; pick a CA to make an intermediate under it."),
+      caFieldRow("Key", keyType),
+      caFieldRow("Validity (days)", days, "An intermediate never outlives the CA that signs it."),
+      caFieldRow("Path length", pathLength, "How many CAs may sit below this one. 0 means it can sign certificates but not other CAs.")
+    );
+    modal({
+      title: "Create Certificate Authority",
+      body,
+      size: "wide",
+      buttons: [{ label: "Cancel" }, {
+        label: "Create",
+        primary: true,
+        onClick: async () => {
+          let validityDays;
+          let pathLen;
+          try {
+            validityDays = daysValue(days.value);
+            pathLen = pathLengthValue(pathLength.value);
+          } catch (e) {
+            toast2(e.message, "warn");
+            return false;
+          }
+          const subjectText = subject.value.trim();
+          if (!subjectText) {
+            toast2("Subject is required", "warn");
+            return false;
+          }
+          const name = alias.value.trim() || commonNameOf(subjectText);
+          const exists = name && storesRef.current.private.some((c) => (c.alias || "").toLowerCase() === name.toLowerCase());
+          if (exists && !await confirmReplace(name, "private")) return false;
+          return runCa(() => createCertificateAuthority({
+            subject: subjectText,
+            alias: alias.value.trim(),
+            keyType: keyType.value,
+            validityDays,
+            pathLength: pathLen,
+            issuerAlias: issuer.value,
+            replace: exists ? "true" : void 0
+          }), (r) => `Created CA "${r.alias}", valid until ${day(r.notAfter)}` + (r.cappedToIssuer === "true" ? " (cut short to its issuer's expiry)" : ""));
+        }
+      }]
+    });
+  }
+  function openIssue(preselected) {
+    if (!writableStore("private")) return;
+    const held = authorities(storesRef.current.private);
+    if (!held.length) {
+      toast2("There is no CA key pair to issue from. Create a CA first.", "warn");
+      return;
+    }
+    const usable = held.filter((c) => !c.expired);
+    const initial = (usable.find((c) => c.alias === preselected) || usable[0] || held[0]).alias;
+    const ca = caSelect(held.map(caOption), initial);
+    const subject = textInput("CN=host.example.org", { style: { width: "100%" } });
+    const sans = h("textarea", { rows: 3, placeholder: "DNS:host.example.org\nIP:10.0.0.5", style: { width: "100%", fontFamily: "var(--font-mono)", fontSize: "12px" } });
+    const alias = textInput("", { placeholder: "Defaults to the CN", style: { width: "100%" } });
+    const keyType = keyTypeSelect("RSA_2048");
+    const days = textInput(String(DEFAULT_LEAF_DAYS), { style: { width: "120px" } });
+    const until = h("div.hint");
+    const showUntil = () => {
+      const chosen = held.find((c) => c.alias === ca.value);
+      const n = Number(days.value);
+      if (!chosen || !Number.isInteger(n) || n < 1) {
+        until.textContent = "";
+        return;
+      }
+      const { end, capped } = effectiveEnd(n, chosen.notAfter);
+      until.textContent = `Valid until ${day(end)}` + (capped ? ` (cut short: ${chosen.alias} expires first)` : "");
+    };
+    ca.addEventListener("change", showUntil);
+    days.addEventListener("input", showUntil);
+    showUntil();
+    const body = h(
+      "div",
+      { style: { minWidth: "540px", display: "flex", flexDirection: "column", gap: "8px" } },
+      caFieldRow("Issued by", ca, "A CA key pair held in this store. Its chain is stored with the new certificate."),
+      caFieldRow("Subject", subject, "A bare host name is taken as the CN."),
+      caFieldRow("Alt names", sans, "One per line or comma separated: DNS:, IP:, email:, URI:. Left empty, a host name CN is used as a DNS name."),
+      caFieldRow("Alias", alias),
+      caFieldRow("Key", keyType),
+      caFieldRow("Validity (days)", days, null),
+      until
+    );
+    modal({
+      title: "Issue Certificate",
+      body,
+      size: "wide",
+      buttons: [{ label: "Cancel" }, {
+        label: "Issue",
+        primary: true,
+        onClick: async () => {
+          let validityDays;
+          try {
+            validityDays = daysValue(days.value);
+          } catch (e) {
+            toast2(e.message, "warn");
+            return false;
+          }
+          const subjectText = subject.value.trim();
+          if (!subjectText) {
+            toast2("Subject is required", "warn");
+            return false;
+          }
+          const name = alias.value.trim() || commonNameOf(subjectText);
+          const exists = name && storesRef.current.private.some((c) => (c.alias || "").toLowerCase() === name.toLowerCase());
+          if (exists && !await confirmReplace(name, "private")) return false;
+          return runCa(() => issueCertificate({
+            caAlias: ca.value,
+            subject: subjectText,
+            alias: alias.value.trim(),
+            subjectAltNames: sans.value,
+            keyType: keyType.value,
+            validityDays,
+            replace: exists ? "true" : void 0
+          }), (r) => `Issued "${r.alias}" from ${ca.value}, valid until ${day(r.notAfter)}` + (r.cappedToIssuer === "true" ? " (cut short to the CA's expiry)" : ""));
+        }
+      }]
+    });
+  }
+  function openRenewCa(cert) {
+    if (!writableStore("private") || !storesRef.current.private.includes(cert)) return;
+    const status = renewalStatus(cert);
+    const days = textInput("", { placeholder: "Same length as now", style: { width: "160px" } });
+    const state = status ? status.expired ? `expired ${-status.days} day(s) ago` : `${status.days} day(s) left` : "end date unknown";
+    const body = h(
+      "div",
+      { style: { minWidth: "480px", display: "flex", flexDirection: "column", gap: "8px" } },
+      h("div", `Renew "${cert.alias}" (${cert.type}, ${state}, valid to ${cert.validTo}).`),
+      h("div.hint", "The key and subject stay the same, so every certificate it has already signed keeps validating and anything that trusts it keeps trusting it. Other key pairs that present the old certificate in their chain, and trusted copies of it, are switched to the new one."),
+      cert.type === "Intermediate" ? h("div.hint", "This CA was signed by another, which must also be held here as a key pair; its end date limits the new one.") : null,
+      caFieldRow("Validity (days)", days, "Counted from today. Blank keeps the length of the current period.")
+    );
+    modal({
+      title: "Renew Certificate Authority",
+      body,
+      buttons: [{ label: "Cancel" }, {
+        label: "Renew",
+        primary: true,
+        onClick: async () => {
+          let validityDays;
+          try {
+            validityDays = daysValue(days.value);
+          } catch (e) {
+            toast2(e.message, "warn");
+            return false;
+          }
+          return runCa(() => renewCertificateAuthority({ alias: cert.alias, validityDays }), (r) => {
+            const chains = r.updatedChains ? r.updatedChains.split(",").length : 0;
+            const trusted = r.updatedTrusted ? r.updatedTrusted.split(",").length : 0;
+            return `Renewed "${r.alias}" until ${day(r.notAfter)}` + (chains ? `; updated the chain of ${chains} key pair(s)` : "") + (trusted ? `; refreshed ${trusted} trusted certificate(s)` : "") + (r.cappedToIssuer === "true" ? " (cut short to its issuer's expiry)" : "");
+          });
+        }
+      }]
+    });
+  }
   if (phase === "loading") return /* @__PURE__ */ React.createElement("div", { className: "dt-empty", style: { padding: "40px" } }, "Loading certificates\u2026");
   if (phase === "missing") {
     const managerUrl = `${engineUrl}/tls-manager`;
@@ -23217,8 +23515,8 @@ The existing certificate is used by ${chans.length} channel(s): ${chans.join(", 
   const tabDef = STORE_TABS.find((t) => t.key === tab) || STORE_TABS[0];
   const storeState = storeStateRef.current[tab];
   const canWrite = storeState.status === "ready" && !writePendingRef.current;
-  const act = { openDetails, editAlias, removeCert, canWrite };
-  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "tabs", style: { marginBottom: "10px" } }, STORE_TABS.map((t) => /* @__PURE__ */ React.createElement("button", { key: t.key, type: "button", className: "tab" + (t.key === tab ? " active" : ""), onClick: () => setTab(t.key) }, t.label, " (", storesRef.current[t.key].length, ")"))), /* @__PURE__ */ React.createElement("div", { className: "panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-header" }, tabDef.label, /* @__PURE__ */ React.createElement("div", { className: "panel-tools" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: writePendingRef.current, onClick: refresh }, "Refresh"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: () => openImportFile("trusted") }, "Import Certificate"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportChain }, "Import Chain"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportUrl }, "Import from URL"), tab === "private" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm btn-primary", disabled: !canWrite, onClick: () => openImportFile("private") }, "Import Key Pair"))), /* @__PURE__ */ React.createElement("div", { className: "panel-body flush" }, tabDef.readonly && /* @__PURE__ */ React.createElement("div", { className: "hint", style: { padding: "8px 14px" } }, "Read-only system truststore (from the engine's JRE)."), storeState.error && /* @__PURE__ */ React.createElement("div", { role: "alert", style: { padding: "12px 14px", color: "var(--err)" } }, storeState.error), certTableEl(storesRef.current[tab], tab, act))), /* @__PURE__ */ React.createElement("div", { className: "text-text-faint", style: { marginTop: "10px", fontSize: "11px" } }, version ? `TLS Manager Plugin ${version} \xB7 ` : "", "Sponsored by NovaMap Health & Diridium Technologies, donated to the Open Integration Engine initiative."));
+  const act = { openDetails, editAlias, removeCert, canWrite, issueFrom: (c) => openIssue(c.alias), renewCa: openRenewCa };
+  return /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "tabs", style: { marginBottom: "10px" } }, STORE_TABS.map((t) => /* @__PURE__ */ React.createElement("button", { key: t.key, type: "button", className: "tab" + (t.key === tab ? " active" : ""), onClick: () => setTab(t.key) }, t.label, " (", storesRef.current[t.key].length, ")"))), /* @__PURE__ */ React.createElement("div", { className: "panel" }, /* @__PURE__ */ React.createElement("div", { className: "panel-header" }, tabDef.label, /* @__PURE__ */ React.createElement("div", { className: "panel-tools" }, /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: writePendingRef.current, onClick: refresh }, "Refresh"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: () => openImportFile("trusted") }, "Import Certificate"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportChain }, "Import Chain"), tab === "trusted" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: openImportUrl }, "Import from URL"), tab === "private" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: () => openCreateCa() }, "Create CA"), tab === "private" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm", disabled: !canWrite, onClick: () => openIssue() }, "Issue Certificate"), tab === "private" && /* @__PURE__ */ React.createElement("button", { type: "button", className: "btn btn-sm btn-primary", disabled: !canWrite, onClick: () => openImportFile("private") }, "Import Key Pair"))), /* @__PURE__ */ React.createElement("div", { className: "panel-body flush" }, tabDef.readonly && /* @__PURE__ */ React.createElement("div", { className: "hint", style: { padding: "8px 14px" } }, "Read-only system truststore (from the engine's JRE)."), storeState.error && /* @__PURE__ */ React.createElement("div", { role: "alert", style: { padding: "12px 14px", color: "var(--err)" } }, storeState.error), certTableEl(storesRef.current[tab], tab, act))), /* @__PURE__ */ React.createElement("div", { className: "text-text-faint", style: { marginTop: "10px", fontSize: "11px" } }, version ? `TLS Manager Plugin ${version} \xB7 ` : "", "Sponsored by NovaMap Health & Diridium Technologies, donated to the Open Integration Engine initiative."));
 }
 var EXPIRY_SESSION_KEY = "tlsManagerExpiryChecked";
 function startExpiryWarning() {

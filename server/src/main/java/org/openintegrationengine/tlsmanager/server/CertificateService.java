@@ -51,6 +51,7 @@ import java.net.NoRouteToHostException;
 import java.net.SocketTimeoutException;
 import java.net.URL;
 import java.net.UnknownHostException;
+import java.security.GeneralSecurityException;
 import java.security.InvalidKeyException;
 import java.security.Key;
 import java.security.KeyFactory;
@@ -544,6 +545,246 @@ public final class CertificateService {
                  NoSuchAlgorithmException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    /**
+     * What a CA operation produced and saved.
+     *
+     * @param alias            the key pair entry written
+     * @param chain            its certificate chain, certificate first
+     * @param key              its private key
+     * @param cappedToIssuer   true when the end date was cut short to the issuing CA's
+     * @param updatedChains    other key pairs whose chain held the replaced CA certificate and now holds the new one
+     * @param updatedTrusted   trusted certificates that were the replaced CA certificate and now are the new one
+     */
+    public record CaResult(String alias, X509Certificate[] chain, PrivateKey key, boolean cappedToIssuer,
+                           List<String> updatedChains, List<String> updatedTrusted) {
+    }
+
+    /**
+     * Creates a CA key pair and saves it under {@code alias}: a self-signed root, or, with
+     * {@code issuerAlias}, an intermediate signed by a CA key pair already held.
+     */
+    public synchronized CaResult createCa(String alias, String subject, String keyType, Integer validityDays,
+                                          Integer pathLength, String issuerAlias, boolean replace) {
+        try {
+            refreshIfChanged();
+            String name = aliasOrCommonName(alias, subject);
+            requireFreeAlias(name, replace);
+            KeyEntry issuer = isBlank(issuerAlias) ? null : keyEntry(issuerAlias);
+            CertificateAuthority.Issued issued = CertificateAuthority.createCa(subject,
+                CertificateAuthority.KeyType.parse(keyType, null), validityDays, pathLength,
+                issuer == null ? null : issuer.key(), issuer == null ? null : issuer.chain(),
+                java.time.Instant.now());
+            putKeyEntry(name, issued.privateKey(), issued.chain());
+            log.info("Created CA \"{}\" ({})", name, issued.certificate().getSubjectX500Principal().getName());
+            return new CaResult(name, issued.chain(), issued.privateKey(), issued.cappedToIssuer(), List.of(), List.of());
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not create the CA: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Renews the CA key pair {@code alias}: the same key and subject, a new validity period. A
+     * self-signed root signs its own renewal; an intermediate is signed by the CA that issued it,
+     * found among the key pairs held unless {@code issuerAlias} names it.
+     *
+     * <p>Every other key pair whose chain held the old CA certificate is given the new one, and so
+     * is every trusted certificate that was the old CA certificate, so connectors present and
+     * trust the current certificate.
+     */
+    public synchronized CaResult renewCa(String alias, Integer validityDays, String issuerAlias) {
+        try {
+            refreshIfChanged();
+            KeyEntry current = keyEntry(alias);
+            X509Certificate old = current.chain()[0];
+            KeyEntry issuer = null;
+            if (CertificateAuthority.isCa(old) && !CertificateAuthority.isSelfSigned(old)) {
+                issuer = isBlank(issuerAlias) ? findIssuer(alias, old) : keyEntry(issuerAlias);
+            }
+            CertificateAuthority.Issued issued = CertificateAuthority.renewCa(current.key(), current.chain(),
+                validityDays, issuer == null ? null : issuer.key(), issuer == null ? null : issuer.chain(),
+                java.time.Instant.now());
+
+            putKeyEntry(alias, issued.privateKey(), issued.chain());
+            List<String> chains = replaceInOtherChains(alias, old, issued.certificate());
+            List<String> trusted = replaceTrusted(old, issued.certificate());
+            log.info("Renewed CA \"{}\" until {}; updated {} chain(s) and {} trusted certificate(s)", alias,
+                issued.certificate().getNotAfter().toInstant(), chains.size(), trusted.size());
+            return new CaResult(alias, issued.chain(), issued.privateKey(), issued.cappedToIssuer(), chains, trusted);
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not renew the CA: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Issues a leaf certificate, with a new key pair, from the CA key pair {@code caAlias} (a root or
+     * an intermediate) and saves it under {@code alias}, default the subject's CN. Its chain is the
+     * CA's chain with the new certificate in front.
+     */
+    public synchronized CaResult issueLeaf(String caAlias, String alias, String subject, List<String> altNames,
+                                           String keyType, Integer validityDays, boolean replace) {
+        try {
+            refreshIfChanged();
+            KeyEntry ca = keyEntry(caAlias);
+            String name = aliasOrCommonName(alias, subject);
+            requireFreeAlias(name, replace);
+            CertificateAuthority.Issued issued = CertificateAuthority.issueLeaf(ca.key(), ca.chain(), subject,
+                altNames, CertificateAuthority.KeyType.parse(keyType, null), validityDays, java.time.Instant.now());
+            putKeyEntry(name, issued.privateKey(), issued.chain());
+            log.info("Issued \"{}\" ({}) from CA \"{}\"", name,
+                issued.certificate().getSubjectX500Principal().getName(), caAlias);
+            return new CaResult(name, issued.chain(), issued.privateKey(), issued.cappedToIssuer(), List.of(), List.of());
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Could not issue the certificate: " + e.getMessage(), e);
+        }
+    }
+
+    private record KeyEntry(PrivateKey key, X509Certificate[] chain) {
+    }
+
+    private KeyEntry keyEntry(String alias) throws GeneralSecurityException {
+        if (isBlank(alias)) {
+            throw new IllegalArgumentException("A key pair alias is required.");
+        }
+        if (!externalKeyStore.isKeyEntry(alias)) {
+            throw new IllegalArgumentException("There is no key pair named \"" + alias + "\".");
+        }
+        Key key = externalKeyStore.getKey(alias, extraKeyStoreBackend.loadPassword());
+        Certificate[] chain = externalKeyStore.getCertificateChain(alias);
+        if (!(key instanceof PrivateKey privateKey) || chain == null || chain.length == 0) {
+            throw new IllegalArgumentException("\"" + alias + "\" has no private key and certificate.");
+        }
+        X509Certificate[] x509 = new X509Certificate[chain.length];
+        for (int i = 0; i < chain.length; i++) {
+            x509[i] = (X509Certificate) chain[i];
+        }
+        return new KeyEntry(privateKey, x509);
+    }
+
+    /** The key pair, other than {@code self}, whose certificate issued {@code cert}. */
+    private KeyEntry findIssuer(String self, X509Certificate cert) throws GeneralSecurityException {
+        for (String candidate : Collections.list(externalKeyStore.aliases())) {
+            if (candidate.equalsIgnoreCase(self) || !externalKeyStore.isKeyEntry(candidate)) {
+                continue;
+            }
+            KeyEntry entry = keyEntry(candidate);
+            if (CertificateAuthority.isIssuedBy(cert, entry.chain()[0])) {
+                return entry;
+            }
+        }
+        throw new IllegalArgumentException("\"" + self + "\" was issued by \""
+            + cert.getIssuerX500Principal().getName() + "\", whose key pair is not held here; "
+            + "renewing it needs that CA's key pair.");
+    }
+
+    private void requireFreeAlias(String alias, boolean replace) throws KeyStoreException {
+        if (externalKeyStore.containsAlias(alias) && !replace) {
+            throw new IllegalArgumentException("A key pair named \"" + alias + "\" already exists; choose another "
+                + "alias or confirm replacing it.");
+        }
+    }
+
+    /** The alias given, else the subject's CN, made safe for a keystore entry. */
+    private static String aliasOrCommonName(String alias, String subject) {
+        if (!isBlank(alias)) {
+            return alias.trim();
+        }
+        String cn = CertificateAuthority.commonName(CertificateAuthority.parseSubject(subject));
+        if (isBlank(cn)) {
+            throw new IllegalArgumentException("Give an alias, or a subject with a CN to name it after.");
+        }
+        return cn.trim();
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
+    }
+
+    /** Writes a key pair entry to the key store and its backing store; memory is put back if that fails. */
+    private void putKeyEntry(String alias, PrivateKey key, X509Certificate[] chain) throws GeneralSecurityException, IOException {
+        char[] password = extraKeyStoreBackend.loadPassword();
+        try {
+            externalKeyStore.setKeyEntry(alias, key, password, chain);
+            persistKeyStore(password);
+        } catch (GeneralSecurityException | IOException | RuntimeException e) {
+            loadKeyStore(externalKeyStore, loadedKeyStoreBytes, password);
+            throw e;
+        }
+    }
+
+    private void persistKeyStore(char[] password) throws GeneralSecurityException, IOException {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        externalKeyStore.store(out, password);
+        byte[] bytes = out.toByteArray();
+        extraKeyStoreBackend.persist(bytes);
+        loadedKeyStoreBytes = bytes;
+    }
+
+    /** Swaps {@code old} for {@code renewed} in the chain of every key pair but {@code except}. */
+    private List<String> replaceInOtherChains(String except, X509Certificate old, X509Certificate renewed)
+        throws GeneralSecurityException, IOException {
+        char[] password = extraKeyStoreBackend.loadPassword();
+        List<String> changed = new ArrayList<>();
+        for (String candidate : Collections.list(externalKeyStore.aliases())) {
+            if (candidate.equalsIgnoreCase(except) || !externalKeyStore.isKeyEntry(candidate)) {
+                continue;
+            }
+            KeyEntry entry = keyEntry(candidate);
+            boolean touched = false;
+            for (int i = 1; i < entry.chain().length; i++) {
+                if (entry.chain()[i].equals(old)) {
+                    entry.chain()[i] = renewed;
+                    touched = true;
+                }
+            }
+            if (touched) {
+                externalKeyStore.setKeyEntry(candidate, entry.key(), password, entry.chain());
+                changed.add(candidate);
+            }
+        }
+        if (!changed.isEmpty()) {
+            persistKeyStore(password);
+        }
+        return changed;
+    }
+
+    /** Replaces trusted certificates that are {@code old} (same subject and key) with {@code renewed}. */
+    private List<String> replaceTrusted(X509Certificate old, X509Certificate renewed)
+        throws GeneralSecurityException, IOException {
+        List<String> changed = new ArrayList<>();
+        for (String candidate : Collections.list(externalTrustStore.aliases())) {
+            if (!externalTrustStore.isCertificateEntry(candidate)) {
+                continue;
+            }
+            Certificate trusted = externalTrustStore.getCertificate(candidate);
+            if (trusted instanceof X509Certificate x509
+                && x509.getSubjectX500Principal().equals(old.getSubjectX500Principal())
+                && java.util.Arrays.equals(x509.getPublicKey().getEncoded(), old.getPublicKey().getEncoded())) {
+                externalTrustStore.setCertificateEntry(candidate, renewed);
+                changed.add(candidate);
+            }
+        }
+        if (!changed.isEmpty()) {
+            char[] password = extraTrustStoreBackend.loadPassword();
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            externalTrustStore.store(out, password);
+            byte[] bytes = out.toByteArray();
+            extraTrustStoreBackend.persist(bytes);
+            loadedTrustStoreBytes = bytes;
+        }
+        return changed;
+    }
+
+    /** PEM for a chain, as the rest of the API returns it. */
+    public static String pem(X509Certificate[] chain) throws CertificateEncodingException {
+        return encodeCertificateChain(chain);
     }
 
     public List<TrustedCertificate> retrieveRemoteCertificates(String urlString) {

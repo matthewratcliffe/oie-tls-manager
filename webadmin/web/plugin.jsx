@@ -48,6 +48,11 @@ import {
 import { isValidPemCertificate, isValidPemPrivateKey, parseCertificateChainFromPem, base64ToPem, base64ToPrivateKeyPem, parseCertificate, getSuggestedAlias } from './certificateUtils.js';
 import { verifyCertificate } from './verificationUtils.js';
 import { checkExpiry } from './expiryWarning.js';
+import {
+    createCertificateAuthority, renewCertificateAuthority, issueCertificate,
+    authorities, isCaEntry, renewalStatus, effectiveEnd, commonNameOf, daysValue, pathLengthValue,
+    KEY_TYPES, DEFAULT_CA_DAYS, DEFAULT_LEAF_DAYS
+} from './caService.js';
 
 const FQCN = 'org.openintegrationengine.tlsmanager.shared.properties.TLSConnectorProperties';
 // The TLS Manager servlet uses @Path("/tlsmanager") — NOT the usual
@@ -701,6 +706,8 @@ function certTableEl(certs, store, act) {
                         <td className="num">{(c.channelsInUse || []).length || ''}</td>
                         <td style={{ whiteSpace: 'nowrap', textAlign: 'right' }}>
                             <button type="button" className="btn btn-sm" onClick={() => act.openDetails(c)}>Details</button>
+                            {isCaEntry(c) && <button type="button" className="btn btn-sm" disabled={!act.canWrite} title="Generate a key pair and certificate signed by this CA" onClick={() => act.issueFrom(c)}>Issue</button>}
+                            {isCaEntry(c) && <button type="button" className={'btn btn-sm' + ((renewalStatus(c) || {}).due ? ' btn-primary' : '')} disabled={!act.canWrite} title="Re-issue this CA certificate with the same key and a new validity period" onClick={() => act.renewCa(c)}>Renew</button>}
                             {store !== 'native' && <button type="button" className="btn btn-sm" disabled={!act.canWrite} onClick={() => act.editAlias(c)}>Edit</button>}
                             {store !== 'native' && <button type="button" className="btn btn-sm btn-danger" disabled={!act.canWrite} onClick={() => act.removeCert(c)}>Delete</button>}
                         </td>
@@ -1331,6 +1338,161 @@ function TlsManagerPanel() {
         });
     }
 
+    /* ---- certificate authorities: create, renew, issue ---- */
+
+    /* Runs one CA request against the key pair store. These are not whole-store writes, and
+     * the server says plainly when it refuses (no such CA, expired CA, bad subject), so a
+     * failure is shown as the reason and the dialog stays open; the lists are re-read either
+     * way, since a renewal also touches other key pairs and the trusted store. */
+    async function runCa(operation, successMessage) {
+        if (!writableStore('private')) return false;
+        writePendingRef.current = true;
+        force();
+        let ok = false;
+        try {
+            const result = await operation();
+            ok = true;
+            if (mountedRef.current) toast(successMessage(result), 'success');
+        } catch (e) {
+            if (mountedRef.current) toast(e.message || 'The request failed', 'error');
+        } finally {
+            writePendingRef.current = false;
+        }
+        if (mountedRef.current) await refresh();
+        return ok;
+    }
+
+    const day = (d) => (d instanceof Date ? d : new Date(d)).toISOString().slice(0, 10);
+    const caFieldRow = (label, control, hint) => h('div', { style: { display: 'grid', gridTemplateColumns: '150px 1fr', gap: '8px', alignItems: 'start' } },
+        h('label', { style: { paddingTop: '4px' } }, label),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px' } }, control, hint ? h('div.hint', hint) : null));
+    function caSelect(options, value) {
+        const select = h('select', { style: { width: '100%' } }, ...options.map((o) => h('option', { value: o.value, disabled: !!o.disabled }, o.label)));
+        select.value = value;
+        return select;
+    }
+    const caOption = (c) => ({ value: c.alias, label: `${c.alias} (${c.type}, to ${c.notAfter ? day(c.notAfter) : '?'})${c.expired ? ' - expired, renew first' : ''}`, disabled: c.expired });
+    const keyTypeSelect = (value) => caSelect(KEY_TYPES, value);
+
+    /* Create a root CA, or an intermediate signed by a CA already held. */
+    function openCreateCa() {
+        if (!writableStore('private')) return;
+        const held = authorities(storesRef.current.private);
+        const subject = textInput('CN=My Root CA, O=My Organisation', { style: { width: '100%' } });
+        const alias = textInput('', { placeholder: 'Defaults to the CN', style: { width: '100%' } });
+        const issuer = caSelect([{ value: '', label: 'None: self-signed root CA' }, ...held.map(caOption)], '');
+        const keyType = keyTypeSelect('RSA_3072');
+        const days = textInput(String(DEFAULT_CA_DAYS), { style: { width: '120px' } });
+        const pathLength = textInput('', { placeholder: 'No limit', style: { width: '120px' } });
+        const body = h('div', { style: { minWidth: '540px', display: 'flex', flexDirection: 'column', gap: '8px' } },
+            caFieldRow('Subject', subject, 'The CA\'s distinguished name, e.g. CN=Example Root CA, O=Example, C=AU.'),
+            caFieldRow('Alias', alias),
+            caFieldRow('Signed by', issuer, 'Leave as self-signed for a root; pick a CA to make an intermediate under it.'),
+            caFieldRow('Key', keyType),
+            caFieldRow('Validity (days)', days, 'An intermediate never outlives the CA that signs it.'),
+            caFieldRow('Path length', pathLength, 'How many CAs may sit below this one. 0 means it can sign certificates but not other CAs.'));
+        modal({
+            title: 'Create Certificate Authority', body, size: 'wide',
+            buttons: [{ label: 'Cancel' }, {
+                label: 'Create', primary: true, onClick: async () => {
+                    let validityDays; let pathLen;
+                    try { validityDays = daysValue(days.value); pathLen = pathLengthValue(pathLength.value); }
+                    catch (e) { toast(e.message, 'warn'); return false; }
+                    const subjectText = subject.value.trim();
+                    if (!subjectText) { toast('Subject is required', 'warn'); return false; }
+                    const name = alias.value.trim() || commonNameOf(subjectText);
+                    const exists = name && storesRef.current.private.some((c) => (c.alias || '').toLowerCase() === name.toLowerCase());
+                    if (exists && !await confirmReplace(name, 'private')) return false;
+                    return runCa(() => createCertificateAuthority({
+                        subject: subjectText, alias: alias.value.trim(), keyType: keyType.value, validityDays,
+                        pathLength: pathLen, issuerAlias: issuer.value, replace: exists ? 'true' : undefined
+                    }), (r) => `Created CA "${r.alias}", valid until ${day(r.notAfter)}` + (r.cappedToIssuer === 'true' ? ' (cut short to its issuer\'s expiry)' : ''));
+                }
+            }]
+        });
+    }
+
+    /* Issue a leaf certificate, with a new key pair, from a CA key pair that is held here. */
+    function openIssue(preselected) {
+        if (!writableStore('private')) return;
+        const held = authorities(storesRef.current.private);
+        if (!held.length) { toast('There is no CA key pair to issue from. Create a CA first.', 'warn'); return; }
+        const usable = held.filter((c) => !c.expired);
+        const initial = (usable.find((c) => c.alias === preselected) || usable[0] || held[0]).alias;
+        const ca = caSelect(held.map(caOption), initial);
+        const subject = textInput('CN=host.example.org', { style: { width: '100%' } });
+        const sans = h('textarea', { rows: 3, placeholder: 'DNS:host.example.org\nIP:10.0.0.5', style: { width: '100%', fontFamily: 'var(--font-mono)', fontSize: '12px' } });
+        const alias = textInput('', { placeholder: 'Defaults to the CN', style: { width: '100%' } });
+        const keyType = keyTypeSelect('RSA_2048');
+        const days = textInput(String(DEFAULT_LEAF_DAYS), { style: { width: '120px' } });
+        const until = h('div.hint');
+        const showUntil = () => {
+            const chosen = held.find((c) => c.alias === ca.value);
+            const n = Number(days.value);
+            if (!chosen || !Number.isInteger(n) || n < 1) { until.textContent = ''; return; }
+            const { end, capped } = effectiveEnd(n, chosen.notAfter);
+            until.textContent = `Valid until ${day(end)}` + (capped ? ` (cut short: ${chosen.alias} expires first)` : '');
+        };
+        ca.addEventListener('change', showUntil);
+        days.addEventListener('input', showUntil);
+        showUntil();
+        const body = h('div', { style: { minWidth: '540px', display: 'flex', flexDirection: 'column', gap: '8px' } },
+            caFieldRow('Issued by', ca, 'A CA key pair held in this store. Its chain is stored with the new certificate.'),
+            caFieldRow('Subject', subject, 'A bare host name is taken as the CN.'),
+            caFieldRow('Alt names', sans, 'One per line or comma separated: DNS:, IP:, email:, URI:. Left empty, a host name CN is used as a DNS name.'),
+            caFieldRow('Alias', alias),
+            caFieldRow('Key', keyType),
+            caFieldRow('Validity (days)', days, null),
+            until);
+        modal({
+            title: 'Issue Certificate', body, size: 'wide',
+            buttons: [{ label: 'Cancel' }, {
+                label: 'Issue', primary: true, onClick: async () => {
+                    let validityDays;
+                    try { validityDays = daysValue(days.value); } catch (e) { toast(e.message, 'warn'); return false; }
+                    const subjectText = subject.value.trim();
+                    if (!subjectText) { toast('Subject is required', 'warn'); return false; }
+                    const name = alias.value.trim() || commonNameOf(subjectText);
+                    const exists = name && storesRef.current.private.some((c) => (c.alias || '').toLowerCase() === name.toLowerCase());
+                    if (exists && !await confirmReplace(name, 'private')) return false;
+                    return runCa(() => issueCertificate({
+                        caAlias: ca.value, subject: subjectText, alias: alias.value.trim(), subjectAltNames: sans.value,
+                        keyType: keyType.value, validityDays, replace: exists ? 'true' : undefined
+                    }), (r) => `Issued "${r.alias}" from ${ca.value}, valid until ${day(r.notAfter)}` + (r.cappedToIssuer === 'true' ? ' (cut short to the CA\'s expiry)' : ''));
+                }
+            }]
+        });
+    }
+
+    /* Renew a CA: same key and subject, new validity. What it already signed keeps working. */
+    function openRenewCa(cert) {
+        if (!writableStore('private') || !storesRef.current.private.includes(cert)) return;
+        const status = renewalStatus(cert);
+        const days = textInput('', { placeholder: 'Same length as now', style: { width: '160px' } });
+        const state = status ? (status.expired ? `expired ${-status.days} day(s) ago` : `${status.days} day(s) left`) : 'end date unknown';
+        const body = h('div', { style: { minWidth: '480px', display: 'flex', flexDirection: 'column', gap: '8px' } },
+            h('div', `Renew "${cert.alias}" (${cert.type}, ${state}, valid to ${cert.validTo}).`),
+            h('div.hint', 'The key and subject stay the same, so every certificate it has already signed keeps validating and anything that trusts it keeps trusting it. Other key pairs that present the old certificate in their chain, and trusted copies of it, are switched to the new one.'),
+            cert.type === 'Intermediate' ? h('div.hint', 'This CA was signed by another, which must also be held here as a key pair; its end date limits the new one.') : null,
+            caFieldRow('Validity (days)', days, 'Counted from today. Blank keeps the length of the current period.'));
+        modal({
+            title: 'Renew Certificate Authority', body,
+            buttons: [{ label: 'Cancel' }, {
+                label: 'Renew', primary: true, onClick: async () => {
+                    let validityDays;
+                    try { validityDays = daysValue(days.value); } catch (e) { toast(e.message, 'warn'); return false; }
+                    return runCa(() => renewCertificateAuthority({ alias: cert.alias, validityDays }), (r) => {
+                        const chains = r.updatedChains ? r.updatedChains.split(',').length : 0;
+                        const trusted = r.updatedTrusted ? r.updatedTrusted.split(',').length : 0;
+                        return `Renewed "${r.alias}" until ${day(r.notAfter)}`
+                            + (chains ? `; updated the chain of ${chains} key pair(s)` : '')
+                            + (trusted ? `; refreshed ${trusted} trusted certificate(s)` : '')
+                            + (r.cappedToIssuer === 'true' ? ' (cut short to its issuer\'s expiry)' : '');
+                    });
+                }
+            }]
+        });
+    }
     /* ---- render ---- */
     if (phase === 'loading') return <div className="dt-empty" style={{ padding: '40px' }}>Loading certificates…</div>;
     if (phase === 'missing') {
@@ -1347,7 +1509,7 @@ function TlsManagerPanel() {
     const tabDef = STORE_TABS.find((t) => t.key === tab) || STORE_TABS[0];
     const storeState = storeStateRef.current[tab];
     const canWrite = storeState.status === 'ready' && !writePendingRef.current;
-    const act = { openDetails, editAlias, removeCert, canWrite };
+    const act = { openDetails, editAlias, removeCert, canWrite, issueFrom: (c) => openIssue(c.alias), renewCa: openRenewCa };
 
     return (
         <div>
@@ -1366,6 +1528,8 @@ function TlsManagerPanel() {
                         {tab === 'trusted' && <button type="button" className="btn btn-sm" disabled={!canWrite} onClick={() => openImportFile('trusted')}>Import Certificate</button>}
                         {tab === 'trusted' && <button type="button" className="btn btn-sm" disabled={!canWrite} onClick={openImportChain}>Import Chain</button>}
                         {tab === 'trusted' && <button type="button" className="btn btn-sm" disabled={!canWrite} onClick={openImportUrl}>Import from URL</button>}
+                        {tab === 'private' && <button type="button" className="btn btn-sm" disabled={!canWrite} onClick={() => openCreateCa()}>Create CA</button>}
+                        {tab === 'private' && <button type="button" className="btn btn-sm" disabled={!canWrite} onClick={() => openIssue()}>Issue Certificate</button>}
                         {tab === 'private' && <button type="button" className="btn btn-sm btn-primary" disabled={!canWrite} onClick={() => openImportFile('private')}>Import Key Pair</button>}
                     </div>
                 </div>
