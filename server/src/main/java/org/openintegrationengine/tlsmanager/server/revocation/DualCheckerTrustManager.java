@@ -126,6 +126,9 @@ public final class DualCheckerTrustManager extends X509ExtendedTrustManager {
             acceptedIssuers.addAll(List.of(trustManagerDelegate.getAcceptedIssuers()));
         }
         acceptedIssuers.addAll(trustedCASet);
+        // Pinned (non-CA) certificates are advertised too, so a client choosing its
+        // certificate by the server's CA list can find one. Matches a self-signed leaf.
+        acceptedIssuers.addAll(trustedLeafCertSet);
         this.acceptedIssuers = acceptedIssuers.toArray(new X509Certificate[0]);
     }
 
